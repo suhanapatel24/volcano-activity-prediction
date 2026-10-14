@@ -2,11 +2,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-
 import joblib
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
@@ -17,130 +13,116 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
-ALIASES = {
-    "volcano_number": ["volcano_number", "volcano no", "volcano number", "volcano id"],
-    "volcano_name": ["volcano_name", "volcano name", "volcano"],
-    "start_year": ["start_year", "start year", "eruption start year"],
-    "vei": ["vei", "volcanic explosivity index"],
-    "region": ["region", "volcanic region", "subregion"],
-}
-FEATURES = ["start_year", "dormancy_years", "region"]
+FEATURES = ["start_year", "dormancy_years", "evidence_method"]
 
-def normalize_columns(frame):
-    def clean(name):
-        return re.sub(r"[^a-z0-9]+", " ", str(name).lower()).strip()
-    by_name = {clean(col): col for col in frame.columns}
-    renames = {}
-    for target, options in ALIASES.items():
-        for option in options:
-            source = by_name.get(clean(option))
-            if source is not None:
-                renames[source] = target
-                break
-    frame = frame.rename(columns=renames).copy()
-    required = {"volcano_name", "start_year", "vei"}
-    missing = required - set(frame.columns)
-    if missing:
-        raise ValueError(f"Missing columns: {sorted(missing)}. Check GVP workbook schema.")
-    if "volcano_number" not in frame:
-        frame["volcano_number"] = frame["volcano_name"]
-    if "region" not in frame:
-        frame["region"] = "Unknown"
+def load_gvp(path):
+    path = Path(path)
+    if path.suffix.lower() in {".xlsx", ".xlsm"}:
+        # GVP export has a title/provenance row above the real header.
+        frame = pd.read_excel(path, sheet_name="Eruption List", header=1)
+    else:
+        frame = pd.read_csv(path)
     return frame
 
 def prepare(frame):
-    df = normalize_columns(frame)
-    df["start_year"] = pd.to_numeric(df["start_year"], errors="coerce")
-    df["vei"] = pd.to_numeric(df["vei"], errors="coerce")
+    required = {"Volcano Number", "Volcano Name", "Start Year", "VEI"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Missing GVP columns: {sorted(missing)}")
+    df = frame.copy()
+    df["volcano_number"] = df["Volcano Number"].astype(str)
+    df["volcano_name"] = df["Volcano Name"].astype(str)
+    df["start_year"] = pd.to_numeric(df["Start Year"], errors="coerce")
+    df["vei"] = pd.to_numeric(df["VEI"].replace("NULL", np.nan), errors="coerce")
     df.loc[~df["vei"].between(0, 8), "vei"] = np.nan
-    df = df.dropna(subset=["start_year"]).copy()
-    df["volcano_number"] = df["volcano_number"].astype(str)
-    df["region"] = df["region"].fillna("Unknown").astype(str)
-    df = df.sort_values(["volcano_number", "start_year"], kind="stable")
-    # Prior eruption gap is calculated from past eruption start years only.
+    if "Evidence Method (dating)" in df:
+        df["evidence_method"] = df["Evidence Method (dating)"].replace("NULL", np.nan)
+    else:
+        df["evidence_method"] = np.nan
+    df = df.dropna(subset=["start_year"]).sort_values(
+        ["volcano_number", "start_year"], kind="stable"
+    )
     df["dormancy_years"] = df.groupby("volcano_number")["start_year"].diff()
     df.loc[df["dormancy_years"] < 0, "dormancy_years"] = np.nan
     return df.reset_index(drop=True)
 
-def make_estimator(classifier=False):
-    pre = ColumnTransformer([
+def estimator(classifier=False):
+    preprocessing = ColumnTransformer([
         ("numeric", SimpleImputer(strategy="median"), ["start_year", "dormancy_years"]),
-        ("category", Pipeline([
-            ("fill", SimpleImputer(strategy="most_frequent")),
+        ("evidence", Pipeline([
+            ("impute", SimpleImputer(strategy="most_frequent")),
             ("encode", OneHotEncoder(handle_unknown="ignore")),
-        ]), ["region"]),
+        ]), ["evidence_method"]),
     ])
-    model = (RandomForestClassifier(n_estimators=100, random_state=42, min_samples_leaf=2)
-             if classifier else RandomForestRegressor(n_estimators=100, random_state=42, min_samples_leaf=2))
-    return Pipeline([("preprocess", pre), ("model", model)])
+    model = (
+        RandomForestClassifier(
+            n_estimators=150, random_state=42, min_samples_leaf=2,
+            class_weight="balanced", n_jobs=-1
+        )
+        if classifier else
+        RandomForestRegressor(
+            n_estimators=150, random_state=42, min_samples_leaf=2, n_jobs=-1
+        )
+    )
+    return Pipeline([("preprocess", preprocessing), ("model", model)])
 
-def evaluate_and_impute(df, output):
-    observed = df.dropna(subset=["vei"]).copy()
-    summary = {
-        "rows": int(len(df)),
-        "known_vei": int(len(observed)),
-        "missing_vei": int(df["vei"].isna().sum()),
-        "unique_volcanoes": int(df["volcano_number"].nunique()),
-    }
-    df["vei_estimated"] = np.nan
-    if len(observed) < 20 or observed["volcano_number"].nunique() < 4:
-        summary["model_status"] = "insufficient labeled volcano groups"
-        return df, summary
-    splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, test_idx = next(splitter.split(observed, groups=observed["volcano_number"]))
-    train, test = observed.iloc[train_idx], observed.iloc[test_idx]
-    regression = make_estimator()
-    regression.fit(train[FEATURES], train["vei"])
-    summary["vei_mae_holdout"] = float(mean_absolute_error(test["vei"], regression.predict(test[FEATURES])))
-    # Refit on all known values before imputing missing values.
-    regression.fit(observed[FEATURES], observed["vei"])
-    joblib.dump(regression, output / "vei_imputation_model.joblib")
-    missing = df["vei"].isna()
-    if missing.any():
-        df.loc[missing, "vei_estimated"] = np.clip(regression.predict(df.loc[missing, FEATURES]), 0, 8)
-    # Intensity is a retrospective VEI >= 3 label, not a forecast of future eruptions.
-    train_y, test_y = (train["vei"] >= 3).astype(int), (test["vei"] >= 3).astype(int)
-    if train_y.nunique() > 1:
-        classifier = make_estimator(classifier=True)
-        classifier.fit(train[FEATURES], train_y)
-        pred = classifier.predict(test[FEATURES])
-        summary["intensity_accuracy_holdout"] = float(accuracy_score(test_y, pred))
-        summary["intensity_f1_holdout"] = float(f1_score(test_y, pred, zero_division=0))
-        classifier.fit(observed[FEATURES], (observed["vei"] >= 3).astype(int))
-        joblib.dump(classifier, output / "intensity_classifier.joblib")
-    else:
-        summary["classifier_status"] = "single class in training partition"
-    return df, summary
-
-def run(input_path, output_dir):
-    source = Path(input_path)
-    if source.suffix.lower() in {".xlsx", ".xlsm"}:
-        raw = pd.read_excel(source)
-    elif source.suffix.lower() == ".csv":
-        raw = pd.read_csv(source)
-    else:
-        raise ValueError("Provide .csv or .xlsx input")
-    output = Path(output_dir)
+def model(df, output):
+    output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    df = prepare(raw)
-    df, summary = evaluate_and_impute(df, output)
+    observed = df.dropna(subset=["vei"]).copy()
+    metrics = {
+        "rows": int(len(df)),
+        "unique_volcanoes": int(df["volcano_number"].nunique()),
+        "known_vei": int(observed.shape[0]),
+        "missing_vei": int(df["vei"].isna().sum()),
+        "missing_vei_percent": float(100 * df["vei"].isna().mean()),
+    }
+    split = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, test_idx = next(
+        split.split(observed, groups=observed["volcano_number"])
+    )
+    train, test = observed.iloc[train_idx], observed.iloc[test_idx]
+
+    reg = estimator()
+    reg.fit(train[FEATURES], train["vei"])
+    reg_pred = reg.predict(test[FEATURES])
+    metrics["vei_mae_group_holdout"] = float(
+        mean_absolute_error(test["vei"], reg_pred)
+    )
+
+    clf = estimator(classifier=True)
+    y_train = (train["vei"] >= 3).astype(int)
+    y_test = (test["vei"] >= 3).astype(int)
+    clf.fit(train[FEATURES], y_train)
+    clf_pred = clf.predict(test[FEATURES])
+    metrics["intensity_accuracy_group_holdout"] = float(
+        accuracy_score(y_test, clf_pred)
+    )
+    metrics["intensity_f1_group_holdout"] = float(
+        f1_score(y_test, clf_pred, zero_division=0)
+    )
+
+    # Final imputation model learns from all observed VEI rows.
+    reg.fit(observed[FEATURES], observed["vei"])
+    joblib.dump(reg, output / "vei_imputation_model.joblib")
+    df["vei_estimated"] = np.nan
+    missing = df["vei"].isna()
+    df.loc[missing, "vei_estimated"] = np.clip(
+        reg.predict(df.loc[missing, FEATURES]), 0, 8
+    )
     df.to_csv(output / "cleaned_eruptions.csv", index=False)
-    (output / "metrics.json").write_text(json.dumps(summary, indent=2))
-    fig, ax = plt.subplots(figsize=(7, 4))
-    df["vei"].dropna().hist(ax=ax, bins=np.arange(-0.5, 9.5, 1))
-    ax.set(title="Observed eruption VEI distribution", xlabel="VEI", ylabel="Count")
-    fig.tight_layout()
-    fig.savefig(output / "vei_distribution.png", dpi=140)
-    plt.close(fig)
-    print(json.dumps(summary, indent=2))
-    return summary
+    (output / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    return metrics
+
+def run(input_path, output):
+    return model(prepare(load_gvp(input_path)), output)
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", default="outputs")
     args = parser.parse_args()
-    run(args.input, args.output)
+    print(json.dumps(run(args.input, args.output), indent=2))
 
 if __name__ == "__main__":
     main()

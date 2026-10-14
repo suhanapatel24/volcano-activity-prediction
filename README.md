@@ -1,41 +1,50 @@
 # Volcano Activity Prediction System
 
-Reconstructed portfolio implementation based on Suhana Patel's resume description (the original source files were unavailable). This project analyzes Smithsonian Global Volcanism Program (GVP) eruption records, engineers historical dormancy features, and trains models for **VEI imputation** and **eruption-intensity classification**.
+Machine-learning analysis of the supplied Smithsonian Global Volcanism Program (GVP) Holocene confirmed-eruption workbook.
 
-**Important:** This is retrospective analysis, not a real-time eruption forecast or hazard-warning system. No measured results or 10,000-row dataset are claimed until an actual dataset is processed.
+## Dataset used
 
-## Data
+`GVP_Eruption_List_Holocene_20260424.xlsx` contains **9,918 confirmed eruption records**, **854 volcanoes**, and 22 eruption fields. The supplied workbook has **7,725 known VEI values** and **2,193 missing VEI values (22.11%)**.
 
-Download the official **Confirmed Holocene Eruptions** spreadsheet from https://volcano.si.edu/search_eruption.cfm and place it at `data/raw/eruptions.xlsx`. The Smithsonian publishes a current workbook and its database citation at that page. Dataset contents and schema may change across releases.
+The workbook's Info sheet provides this citation:
+Global Volcanism Program, 2024. *Volcanoes of the World* (v. 5.2.8; 6 May 2025), Smithsonian Institution, compiled by Venzke, E. https://doi.org/10.5479/si.GVP.VOTW5-2024.5.2
 
-GVP citation: Global Volcanism Program (2026), *Volcanoes of the World*, v5.4.0, Smithsonian Institution, https://doi.org/10.5479/si.GVP.VOTW5-2026.5.4.
+The Eruption List sheet itself identifies the export as Volcanoes of the World 5.3.5, downloaded 24 April 2026. Both pieces of provenance are retained because they appear in the supplied file.
+
+## Pipeline
+
+- cleans GVP `NULL` values and numeric fields
+- engineers previous-eruption dormancy by volcano
+- uses eruption start year, dormancy, and dating-evidence method
+- evaluates VEI imputation with Random Forest regression
+- evaluates retrospective higher-intensity classification (`VEI >= 3`)
+- uses a volcano-group holdout to reduce same-volcano train/test leakage
+- refits the VEI model on all known labels and estimates only missing VEI rows
+
+## Measured baseline on the supplied workbook
+
+Using random_state=42 and a 20% volcano-group holdout:
+
+- VEI regression holdout: **MAE 0.741 VEI units**
+- Higher-intensity classification: **78.31% accuracy**
+- Higher-intensity classification: **F1 0.588**
+
+These are exploratory retrospective metrics, not future-eruption forecasting performance and not public-safety validation.
 
 ## Run
 
 ```bash
 pip install -r requirements.txt
-python -m volcano.pipeline --input data/raw/eruptions.xlsx --output outputs
+python -m volcano.pipeline --input data/raw/GVP_Eruption_List_Holocene_20260424.xlsx --output outputs
 pytest -q
 ```
 
-The pipeline writes `cleaned_eruptions.csv`, `metrics.json`, `vei_imputation_model.joblib`, `intensity_classifier.joblib`, and `figures/` where enough labeled data is available.
+The source workbook is not committed automatically; place your supplied file under `data/raw/`.
 
-## Methods
+## Resume-safe summary
 
-- Normalizes common GVP workbook column-name variants
-- Parses eruption start years and missing VEI
-- Computes prior-eruption gap by volcano without using future eruption information
-- Predicts known VEI values using cross-validated Random Forest regression
-- Classifies observed eruptions into lower/higher intensity categories
-- Produces data-quality summaries and exploratory figures
-- Keeps missing-value estimates separate from observed VEI
+Analyzed ~10K Smithsonian GVP confirmed-eruption records, engineered historical dormancy features, and built reproducible Random Forest pipelines for missing-VEI estimation and retrospective eruption-intensity analysis.
 
-**Evaluation caution:** historical records are incomplete, and random splits can overstate generalization across volcanoes and time. Metrics are exploratory and should not be used for public-safety decisions.
+## Safety / interpretation
 
-## Cloud extension
-
-The original resume mentions GCP storage/notebooks. This reconstructed version runs locally first. `docs/gcp.md` explains how to upload artifacts to Cloud Storage; no cloud deployment is claimed.
-
-## Project provenance
-
-Original notebooks and the original ~10,000-row merged dataset were not supplied. This repository is a new reconstruction based on the resume scope, not a recovery of the original experiment or its metrics.
+This project does **not** predict whether or when a volcano will erupt. Historical eruption catalogs have incompleteness and uncertainty, especially farther back in time. Outputs are for data-science education and portfolio analysis only.
