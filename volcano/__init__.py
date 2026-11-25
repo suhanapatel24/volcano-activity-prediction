@@ -1,0 +1,1 @@
+"""Retrospective volcano eruption analysis pipeline."""
